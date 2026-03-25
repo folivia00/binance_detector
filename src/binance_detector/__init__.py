@@ -1,0 +1,2 @@
+"""Binance detector project scaffold."""
+

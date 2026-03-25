@@ -1,0 +1,14 @@
+{
+  "default_allowed_tiers": ["medium", "strong", "very_strong"],
+  "by_time": {
+    "late": ["strong", "very_strong"],
+    "final": ["very_strong"]
+  },
+  "by_distance": {
+    "stretched": ["strong", "very_strong"]
+  },
+  "by_time_distance": {
+    "late|stretched": ["very_strong"],
+    "final|stretched": []
+  }
+}

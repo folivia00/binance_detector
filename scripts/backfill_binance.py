@@ -1,0 +1,15 @@
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from binance_detector.storage.paths import ensure_data_dirs
+
+
+if __name__ == "__main__":
+    ensure_data_dirs()
+    print("Backfill placeholder: fetch Binance candles and persist them into data/raw/binance.")

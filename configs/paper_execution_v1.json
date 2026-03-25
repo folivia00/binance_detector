@@ -1,0 +1,6 @@
+{
+  "cooldown_seconds": 30,
+  "max_slippage_bps": 150.0,
+  "min_entry_confidence": 0.55,
+  "no_entry_last_seconds": 10
+}

@@ -1,0 +1,18 @@
+[project]
+name = "binance-detector"
+version = "0.1.0"
+description = "Bot scaffold for predicting 5-minute Bitcoin price rounds on Polymarket using Binance market data."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

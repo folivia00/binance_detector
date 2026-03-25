@@ -1,0 +1,1 @@
+"""Microstructure detector signal core."""

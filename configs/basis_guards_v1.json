@@ -1,0 +1,9 @@
+{
+  "max_basis_bps": 15.0,
+  "max_settle_age_seconds": 3.0,
+  "max_pm_quote_age_seconds": 2.0,
+  "min_book_liquidity": 150.0,
+  "max_spread_bps": 650.0,
+  "min_entry_t_left_seconds": 20,
+  "no_entry_last_seconds": 10
+}

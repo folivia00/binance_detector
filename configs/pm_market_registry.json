@@ -1,0 +1,14 @@
+{
+  "markets": [
+    {
+      "market_key": "btc_updown_5m",
+      "description": "Dynamic BTC Up/Down 5m market resolved by round start epoch.",
+      "market_slug": "",
+      "market_slug_template": "btc-updown-5m-{round_start_epoch}",
+      "search_query": "",
+      "yes_token_id": "",
+      "no_token_id": "",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "version": "v1",
+  "medium_min_edge": 0.08,
+  "strong_min_edge": 0.18,
+  "very_strong_min_edge": 0.30,
+  "very_strong_cap_enabled": false,
+  "very_strong_cap_edge": 0.45
+}
