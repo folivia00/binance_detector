@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -56,15 +57,17 @@ class BinanceClient:
 
     def fetch_signal_snapshot(self, *, allow_demo_fallback: bool = True) -> BinanceSignalSnapshot:
         try:
-            order_book = self._get_json(
-                path="/api/v3/depth",
-                params={"symbol": self.symbol, "limit": 20},
-            )
-            trades = self._get_json(
-                path="/api/v3/trades",
-                params={"symbol": self.symbol, "limit": 50},
-            )
-            candles = self.fetch_recent_candles(interval="1m", limit=5)
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                f_depth = executor.submit(
+                    lambda: self._get_json(path="/api/v3/depth", params={"symbol": self.symbol, "limit": 20})
+                )
+                f_trades = executor.submit(
+                    lambda: self._get_json(path="/api/v3/trades", params={"symbol": self.symbol, "limit": 50})
+                )
+                f_candles = executor.submit(self.fetch_recent_candles, "1m", 5)
+                order_book = f_depth.result()
+                trades = f_trades.result()
+                candles = f_candles.result()
             snapshot = self._build_live_snapshot(order_book=order_book, trades=trades, candles=candles)
             self.last_snapshot_source = "live"
             self.last_fallback_reason = ""

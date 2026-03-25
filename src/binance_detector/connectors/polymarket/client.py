@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 from urllib.parse import urlencode
@@ -21,6 +22,7 @@ class PolymarketClient:
     clob_base_url: str = "https://clob.polymarket.com"
     timeout_seconds: float = 6.0
     user_agent: str = "Mozilla/5.0"
+    _token_cache: dict[str, tuple[str, str]] = field(default_factory=dict, init=False)
 
     def get_active_round(self) -> MarketRound | None:
         now = datetime.now(timezone.utc)
@@ -93,14 +95,25 @@ class PolymarketClient:
     def get_quote_for_spec_at(self, spec: PolymarketMarketSpec, ts: datetime) -> PolymarketQuote:
         resolved_slug = self.resolve_market_slug_for_spec(spec, ts)
         if resolved_slug:
-            market = self.get_market_by_slug(resolved_slug)
-            if market:
-                token_ids = json.loads(market.get("clobTokenIds", "[]"))
+            if resolved_slug not in self._token_cache:
+                market = self.get_market_by_slug(resolved_slug)
+                token_ids = json.loads(market.get("clobTokenIds", "[]")) if market else []
                 if len(token_ids) >= 2:
-                    return self.get_quote(
-                        yes_token_id=str(token_ids[0]),
-                        no_token_id=str(token_ids[1]),
-                    )
+                    self._token_cache[resolved_slug] = (str(token_ids[0]), str(token_ids[1]))
+                    if len(self._token_cache) > 3:
+                        del self._token_cache[next(iter(self._token_cache))]
+            cached = self._token_cache.get(resolved_slug)
+            if cached:
+                yes_token_id, no_token_id = cached
+                try:
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        f_yes = executor.submit(self.get_order_book, yes_token_id)
+                        f_no = executor.submit(self.get_order_book, no_token_id)
+                        yes_book = f_yes.result()
+                        no_book = f_no.result()
+                    return self._build_quote(yes_book=yes_book, no_book=no_book)
+                except Exception:
+                    return self._demo_quote()
         return self.get_quote(
             query=spec.lookup_query,
             yes_token_id=spec.yes_token_id or None,

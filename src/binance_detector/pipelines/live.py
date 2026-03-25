@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from binance_detector.config.market_registry import PolymarketMarketSpec, get_market_spec
 from binance_detector.config.settings import settings
@@ -47,7 +48,20 @@ class LivePaperRunner:
         self._previous_snapshot = None
 
     def evaluate_once(self) -> TradingSignal | None:
-        snapshot = self.binance.fetch_signal_snapshot(allow_demo_fallback=self.allow_demo_fallback)
+        now_ts = datetime.now(timezone.utc)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f_snap = executor.submit(
+                self.binance.fetch_signal_snapshot,
+                allow_demo_fallback=self.allow_demo_fallback,
+            )
+            f_quote = executor.submit(
+                self.polymarket.get_quote_for_spec_at,
+                self.market_spec,
+                now_ts,
+            )
+            snapshot = f_snap.result()
+            quote = f_quote.result()
+
         if snapshot.snapshot_source != "live":
             round_id = self.round_manager.canonical_round_id(
                 ts=snapshot.ts,
@@ -94,7 +108,6 @@ class LivePaperRunner:
         prediction = self.model.predict(features=features, round_id=current_round.round_id)
         action = "YES" if prediction.p_up_total >= 0.5 else "NO"
         confidence = prediction.p_up_total if action == "YES" else prediction.p_down_total
-        quote = self.polymarket.get_quote_for_spec_at(self.market_spec, snapshot.ts)
         guard_decision = evaluate_entry_guards(
             current_market_price=snapshot.market_price,
             settle_reference=SettleReference(price=snapshot.market_price, age_seconds=0.0),
