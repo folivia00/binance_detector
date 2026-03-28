@@ -25,6 +25,7 @@ class TradingSignal:
     pm_book_liquidity: float = 0.0
     pm_spread_bps: float = 0.0
     expected_slippage_bps: float = 0.0
+    pm_entry_price: float = 0.0
     raw_score: float = 0.0
     probability_edge: float = 0.0
     calibration_version: str = ""
