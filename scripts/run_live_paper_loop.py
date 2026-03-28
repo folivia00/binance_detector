@@ -37,7 +37,14 @@ if __name__ == "__main__":
         for index in range(args.iterations):
             obs = ObservabilityState.read(state_path)
             obs.touch_heartbeat()
-            signal = runner.evaluate_once()
+            try:
+                signal = runner.evaluate_once()
+            except Exception as exc:
+                print(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                  "event": "evaluate_once_error", "error": str(exc)}),
+                      flush=True)
+                time.sleep(30)
+                continue
             if signal is None:
                 obs.write(state_path)
                 time.sleep(args.interval_seconds)
@@ -74,6 +81,7 @@ if __name__ == "__main__":
                 "pm_book_liquidity": signal.pm_book_liquidity,
                 "pm_spread_bps": signal.pm_spread_bps,
                 "expected_slippage_bps": signal.expected_slippage_bps,
+                "pm_entry_price": signal.pm_entry_price,
             }
             handle.write(json.dumps(row) + "\n")
             current_round_rows.append(row)

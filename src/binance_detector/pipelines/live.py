@@ -156,6 +156,7 @@ class LivePaperRunner:
             pm_book_liquidity=quote.book_liquidity,
             pm_spread_bps=quote.spread_bps(action),
             expected_slippage_bps=paper_decision.expected_slippage_bps,
+            pm_entry_price=quote.ask_price(action),
             raw_score=float(prediction.debug_components.get("raw_score", 0.0)),
             probability_edge=prediction.probability_edge,
             calibration_version=prediction.calibration_version,
