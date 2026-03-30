@@ -20,7 +20,7 @@ description: >
 | branch | what it holds | what to NEVER commit here |
 |--------|--------------|--------------------------|
 | `dev` | src/, scripts/, configs/, docs/stages/, docs/roadmap/, CLAUDE.md, *_Lardio.md | data/logs/, docs/reports/, .venv/, __pycache__ |
-| `main` | src/, scripts/, configs/, requirements*.txt, docs/README.md, docs/VPS_QUICKSTART.md | docs/stages/, *_Lardio.md, docs/roadmap/ |
+| `main` | src/, scripts/, configs/, requirements*.txt, docs/README.md, docs/VPS_QUICKSTART.md | docs/stages/, *_Lardio.md, docs/roadmap/, .claude/, skills-lock.json |
 
 Always gitignored on BOTH branches (never commit):
 - `data/logs/*.jsonl` — live data, transferred via scp
