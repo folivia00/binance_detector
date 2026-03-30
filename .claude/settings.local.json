@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(wc -l /c/Users/Lardio/Desktop/wall_signal_bot/binance_detector/src/binance_detector/**/*.py)"
-    ]
-  }
-}
