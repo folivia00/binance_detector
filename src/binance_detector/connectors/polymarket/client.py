@@ -159,10 +159,10 @@ class PolymarketClient:
         no_bids = no_book.get("bids", [])
         no_asks = no_book.get("asks", [])
         yes_bid = float(yes_bids[-1]["price"]) if yes_bids else 0.0
-        yes_ask = float(yes_asks[0]["price"]) if yes_asks else 1.0
+        yes_ask = float(yes_asks[-1]["price"]) if yes_asks else 1.0  # asks sorted DESCENDING → [-1] = best (cheapest) ask
         no_bid = float(no_bids[-1]["price"]) if no_bids else 0.0
-        no_ask = float(no_asks[0]["price"]) if no_asks else 1.0
-        book_liquidity = sum(float(level["size"]) for level in yes_bids[-5:] + yes_asks[:5] + no_bids[-5:] + no_asks[:5])
+        no_ask = float(no_asks[-1]["price"]) if no_asks else 1.0    # asks sorted DESCENDING → [-1] = best (cheapest) ask
+        book_liquidity = sum(float(level["size"]) for level in yes_bids[-5:] + yes_asks[-5:] + no_bids[-5:] + no_asks[-5:])
         timestamp_ms = max(int(yes_book.get("timestamp", "0")), int(no_book.get("timestamp", "0")))
         quote_age_seconds = 0.0
         if timestamp_ms > 0:
