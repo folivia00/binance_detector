@@ -22,6 +22,7 @@ class BasisGuardConfig:
     max_spread_bps: float = 80.0
     min_entry_t_left_seconds: int = 20
     no_entry_last_seconds: int = 10
+    max_entry_price: float = 1.0
 
     @classmethod
     def from_json(cls, path: Path) -> "BasisGuardConfig":
@@ -62,5 +63,7 @@ def evaluate_entry_guards(
         block_reasons.append("min_entry_tleft")
     if time_left_seconds <= config.no_entry_last_seconds:
         block_reasons.append("no_entry_last_seconds")
+    if pm_quote.ask_price(side) > config.max_entry_price:
+        block_reasons.append("entry_price_too_high")
 
     return GuardDecision(not block_reasons, tuple(block_reasons), basis_bps)
