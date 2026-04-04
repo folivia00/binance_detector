@@ -20,6 +20,7 @@ class Settings:
     entry_policy_path: Path = BASE_DIR / "configs" / "entry_policy_v2.json"
     basis_guards_path: Path = BASE_DIR / "configs" / "basis_guards_v1.json"
     paper_execution_path: Path = BASE_DIR / "configs" / "paper_execution_v1.json"
+    live_execution_path: Path = BASE_DIR / "configs" / "live_execution_v1.json"
     pm_market_registry_path: Path = BASE_DIR / "configs" / "pm_market_registry.json"
     tier_calibration_path: Path = BASE_DIR / "configs" / "tier_calibration_v1.json"
     round_seconds: int = 300

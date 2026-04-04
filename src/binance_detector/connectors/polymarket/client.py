@@ -129,6 +129,25 @@ class PolymarketClient:
             return spec.market_slug_template.format(round_start_epoch=round_start_epoch)
         return ""
 
+    def get_token_ids_for_spec(self, spec: PolymarketMarketSpec, ts: datetime) -> tuple[str, str]:
+        """Return (yes_token_id, no_token_id) for the current round, or ('', '') if unavailable."""
+        resolved_slug = self.resolve_market_slug_for_spec(spec, ts)
+        if not resolved_slug:
+            return "", ""
+        cached = self._token_cache.get(resolved_slug)
+        if cached:
+            return cached
+        try:
+            market = self.get_market_by_slug(resolved_slug)
+            token_ids = json.loads(market.get("clobTokenIds", "[]")) if market else []
+            if len(token_ids) >= 2:
+                pair: tuple[str, str] = (str(token_ids[0]), str(token_ids[1]))
+                self._token_cache[resolved_slug] = pair
+                return pair
+        except Exception:
+            pass
+        return "", ""
+
     def resolve_token_ids(
         self,
         *,
