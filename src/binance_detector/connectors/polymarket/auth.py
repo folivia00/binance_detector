@@ -1,16 +1,24 @@
 """Factory for authenticated Polymarket ClobClient.
 
-Reads credentials from environment variables:
+Supports signature_type=2 (funder/proxy mode) — no separate API keys required.
+Orders are signed directly with the wallet private key.
+
+Required environment variables:
     PM_PRIVATE_KEY       — Polygon wallet private key (hex, with or without 0x)
-    PM_API_KEY           — Polymarket CLOB API key (derive once via setup_pm_api_key.py)
-    PM_API_SECRET        — CLOB API secret
-    PM_API_PASSPHRASE    — CLOB API passphrase
+    PM_FUNDER_ADDRESS    — Wallet address that holds USDC (0x...)
+    PM_SIGNATURE_TYPE    — Signing mode: 0=EOA, 2=proxy/funder (default: 2)
 
 Usage
 -----
     from binance_detector.connectors.polymarket.auth import build_clob_client
-    clob = build_clob_client()          # raises if env vars missing
-    clob = build_clob_client(check=False)  # returns client even without L2 creds (L1 only)
+    clob = build_clob_client()
+
+VPS setup (add to ~/.bashrc):
+    export PM_PRIVATE_KEY=0x<your_private_key>
+    export PM_FUNDER_ADDRESS=0x<your_wallet_address>
+    export PM_SIGNATURE_TYPE=2
+
+SECURITY: Never commit .env files or hardcode credentials in source code.
 """
 from __future__ import annotations
 
@@ -20,45 +28,37 @@ CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 
 
-def build_clob_client(*, check: bool = True) -> object:
-    """Return a configured ClobClient.
+def build_clob_client() -> object:
+    """Return a fully configured ClobClient ready for order placement.
 
-    Parameters
-    ----------
-    check : bool
-        If True (default), raise ValueError if L2 credentials (API key / secret /
-        passphrase) are missing. Set to False for L1-only operations (e.g. deriving
-        API keys during setup).
+    With signature_type=2 and funder address, no API key/secret/passphrase
+    is needed — the wallet key handles both L1 signing and L2 auth.
     """
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds
     except ImportError as exc:
         raise ImportError("py-clob-client not installed. Run: pip install py-clob-client") from exc
 
     private_key = os.getenv("PM_PRIVATE_KEY", "")
     if not private_key:
         raise ValueError(
-            "PM_PRIVATE_KEY environment variable is not set. "
-            "Export your Polygon wallet private key: export PM_PRIVATE_KEY=0x..."
+            "PM_PRIVATE_KEY not set.\n"
+            "  export PM_PRIVATE_KEY=0x<your_polygon_private_key>"
         )
 
-    api_key = os.getenv("PM_API_KEY", "")
-    api_secret = os.getenv("PM_API_SECRET", "")
-    api_passphrase = os.getenv("PM_API_PASSPHRASE", "")
-
-    if check and not (api_key and api_secret and api_passphrase):
+    funder = os.getenv("PM_FUNDER_ADDRESS", "")
+    if not funder:
         raise ValueError(
-            "PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE not set. "
-            "Run scripts/setup_pm_api_key.py once to derive them from PM_PRIVATE_KEY."
+            "PM_FUNDER_ADDRESS not set.\n"
+            "  export PM_FUNDER_ADDRESS=0x<your_wallet_address>"
         )
 
-    creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase) if api_key else None
+    sig_type = int(os.getenv("PM_SIGNATURE_TYPE", "2"))
 
     return ClobClient(
         host=CLOB_HOST,
         chain_id=POLYGON_CHAIN_ID,
         key=private_key,
-        creds=creds,
-        signature_type=0,  # EOA
+        funder=funder,
+        signature_type=sig_type,
     )

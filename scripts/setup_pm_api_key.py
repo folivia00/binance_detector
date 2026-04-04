@@ -1,19 +1,14 @@
-"""One-time setup: derive Polymarket CLOB API credentials from your wallet private key.
+"""Verify Polymarket CLOB connection and wallet status.
 
-Run this once on the VPS (or locally). It will print export commands for the
-three env vars needed by run_live_loop.py.
+With signature_type=2 (funder mode) no API key derivation is needed.
+This script just confirms the wallet is reachable and shows balances.
 
 Usage
 -----
-    export PM_PRIVATE_KEY=0x<your_polygon_private_key>
+    export PM_PRIVATE_KEY=0x<key>
+    export PM_FUNDER_ADDRESS=0x<address>
+    export PM_SIGNATURE_TYPE=2
     python scripts/setup_pm_api_key.py
-
-Output example:
-    export PM_API_KEY="abc123..."
-    export PM_API_SECRET="def456..."
-    export PM_API_PASSPHRASE="xyz789..."
-
-Add these to ~/.bashrc or a .env file on the VPS.
 """
 from __future__ import annotations
 
@@ -29,18 +24,26 @@ from binance_detector.connectors.polymarket.auth import build_clob_client
 
 
 def main() -> None:
-    # L1-only client (no API creds needed yet)
-    clob = build_clob_client(check=False)
-    print(f"Wallet address: {clob.get_address()}")
-    print("Deriving / creating API credentials...")
+    print("Connecting to Polymarket CLOB...")
+    clob = build_clob_client()
 
-    creds = clob.create_or_derive_api_creds()
+    address = clob.get_address()
+    print(f"  Wallet address : {address}")
 
-    print("\nCredentials derived successfully. Add to your environment:\n")
-    print(f'export PM_API_KEY="{creds.api_key}"')
-    print(f'export PM_API_SECRET="{creds.api_secret}"')
-    print(f'export PM_API_PASSPHRASE="{creds.api_passphrase}"')
-    print("\nThen re-run: python scripts/run_live_loop.py --market-key btc_updown_5m --live")
+    try:
+        ok = clob.get_ok()
+        print(f"  CLOB status    : {ok}")
+    except Exception as e:
+        print(f"  CLOB status    : ERROR — {e}")
+
+    try:
+        balance = clob.get_balance_allowance(params={"asset_type": "COLLATERAL"})
+        print(f"  USDC balance   : {balance}")
+    except Exception as e:
+        print(f"  USDC balance   : ERROR — {e}")
+
+    print("\nConnection OK. You can now run:")
+    print("  python scripts/run_live_loop.py --market-key btc_updown_5m --live")
 
 
 if __name__ == "__main__":

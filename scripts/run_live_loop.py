@@ -8,14 +8,13 @@ Usage
     # Dry run (safe, no orders):
     python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800
 
-    # Live trading (requires PM_PRIVATE_KEY, PM_API_KEY, PM_API_SECRET, PM_API_PASSPHRASE):
+    # Live trading:
     python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live
 
-Required env vars for live trading:
+Required env vars for live trading (add to ~/.bashrc on VPS):
     PM_PRIVATE_KEY       — Polygon wallet private key (hex)
-    PM_API_KEY           — PM CLOB API key (from scripts/setup_pm_api_key.py)
-    PM_API_SECRET        — PM CLOB API secret
-    PM_API_PASSPHRASE    — PM CLOB API passphrase
+    PM_FUNDER_ADDRESS    — Wallet address holding USDC
+    PM_SIGNATURE_TYPE    — 2  (funder/proxy mode, no API keys needed)
 """
 from __future__ import annotations
 
