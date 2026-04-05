@@ -11,6 +11,12 @@ Usage
     # Live trading:
     python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live
 
+    # Live trading + redeem worker (default: enabled when --live):
+    python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live
+    python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live --redeem-interval 120
+    python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live --no-redeem
+    python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live --redeem-dry-run
+
 Required env vars for live trading (add to ~/.bashrc on VPS):
     PM_PRIVATE_KEY       — Polygon wallet private key (hex)
     PM_FUNDER_ADDRESS    — Wallet address holding USDC
@@ -22,9 +28,11 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import sys
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +61,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=int, default=5)
     parser.add_argument("--live", action="store_true",
                         help="Enable live trading (requires PM credentials). Default: dry run.")
+    # RedeemWorker options (active only when --live, ignored in dry-run mode)
+    parser.add_argument("--no-redeem", action="store_true",
+                        help="Disable background RedeemWorker (default: enabled with --live).")
+    parser.add_argument("--redeem-dry-run", action="store_true",
+                        help="RedeemWorker checks balances but sends no transactions.")
+    parser.add_argument("--redeem-interval", type=int, default=300,
+                        help="RedeemWorker scan interval in seconds (default: 300).")
     return parser.parse_args()
 
 
@@ -71,6 +86,93 @@ def _serialise(obj: object) -> object:
     if isinstance(obj, (tuple, list)):
         return [_serialise(i) for i in obj]
     return obj
+
+
+POLYGON_RPC_FALLBACKS = [
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+]
+
+
+def _connect_polygon() -> object | None:
+    """Connect to Polygon RPC, trying fallbacks. Returns Web3 or None."""
+    try:
+        from web3 import Web3
+    except ImportError:
+        log.warning("[REDEEM] web3 not installed — RedeemWorker disabled.")
+        return None
+
+    rpc_override = os.getenv("POLYGON_RPC_URL", "")
+    candidates = [rpc_override] if rpc_override else []
+    candidates += [r for r in POLYGON_RPC_FALLBACKS if r not in candidates]
+
+    for url in candidates:
+        try:
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+            w3.eth.block_number  # connectivity check
+            log.info("[REDEEM] Connected to Polygon RPC: %s", url)
+            return w3
+        except Exception:
+            pass
+    log.warning("[REDEEM] All Polygon RPCs failed — RedeemWorker disabled.")
+    return None
+
+
+def _build_redeem_service(log_dir: Path, state_file: Path) -> object | None:
+    """Build SafeExecutor + LiveRedeemService. Returns service or None on error."""
+    private_key = os.getenv("PM_PRIVATE_KEY", "")
+    funder = os.getenv("PM_FUNDER_ADDRESS", "")
+    if not private_key or not funder:
+        log.warning("[REDEEM] PM_PRIVATE_KEY / PM_FUNDER_ADDRESS not set — RedeemWorker disabled.")
+        return None
+
+    w3 = _connect_polygon()
+    if w3 is None:
+        return None
+
+    try:
+        from binance_detector.execution.safe_executor import SafeExecutor
+        from binance_detector.services.redeem_live import LiveRedeemService
+
+        executor = SafeExecutor(w3=w3, safe_address=funder, eoa_private_key=private_key)
+        if not executor.is_available():
+            log.warning("[REDEEM] SafeExecutor: EOA is not owner of Safe %s — disabled.", funder)
+            return None
+
+        service = LiveRedeemService(
+            w3=w3,
+            safe_executor=executor,
+            log_dir=log_dir,
+            state_file=state_file,
+        )
+        return service
+    except Exception as exc:
+        log.warning("[REDEEM] Could not initialize RedeemService: %s", exc)
+        return None
+
+
+def _redeem_worker(service: object, interval_seconds: int, dry_run: bool) -> None:
+    """Background daemon thread: scan and redeem every interval_seconds."""
+    log.info("[REDEEM] Worker started (interval=%ds, dry_run=%s)", interval_seconds, dry_run)
+    while True:
+        try:
+            results = service.scan_and_redeem(dry_run=dry_run)
+            redeemed = [r for r in results if r.status == "redeemed"]
+            dry_found = [r for r in results if r.status == "dry_run"]
+            if redeemed:
+                for r in redeemed:
+                    log.info("[REDEEM] Redeemed %s %.4f USDC tx=%s",
+                             r.slug, r.balance_usd, r.tx_hash)
+            elif dry_found:
+                for r in dry_found:
+                    log.info("[REDEEM] DRY_RUN %s would redeem %.4f USDC",
+                             r.slug, r.balance_usd)
+            else:
+                log.debug("[REDEEM] No new positions to redeem.")
+        except Exception as exc:
+            log.error("[REDEEM] Worker error: %s", exc, exc_info=True)
+        time.sleep(interval_seconds)
 
 
 def main() -> None:
@@ -101,12 +203,42 @@ def main() -> None:
     log.info("Logging to %s", log_path)
     log.info("stake_usd=%.2f dry_run=%s iterations=%d", live_cfg.stake_usd, live_cfg.dry_run, args.iterations)
 
+    # Start RedeemWorker only in live (non-dry-run) mode and if not disabled
+    if not live_cfg.dry_run and not args.no_redeem:
+        state_file = ROOT / "data" / "logs" / "redeem_done.json"
+        redeem_service = _build_redeem_service(
+            log_dir=ROOT / "data" / "logs",
+            state_file=state_file,
+        )
+        if redeem_service is not None:
+            t = threading.Thread(
+                target=_redeem_worker,
+                args=(redeem_service, args.redeem_interval, args.redeem_dry_run),
+                daemon=True,
+                name="RedeemWorker",
+            )
+            t.start()
+            log.info(
+                "RedeemWorker started (interval=%ds, dry_run=%s, state=%s)",
+                args.redeem_interval, args.redeem_dry_run, state_file,
+            )
+        else:
+            log.warning("RedeemWorker could not start — check env vars and RPC.")
+    else:
+        if live_cfg.dry_run:
+            log.info("RedeemWorker disabled (trading dry_run mode).")
+        else:
+            log.info("RedeemWorker disabled (--no-redeem flag).")
+
     last_entry_ts: datetime | None = None
     last_entered_round: str | None = None
+    last_round_id: str = ""
 
     with log_path.open("a", encoding="utf-8") as fh:
         for i in range(args.iterations):
             now = datetime.now(timezone.utc)
+            if i > 0 and i % 12 == 0:
+                log.info("tick=%d round=%s", i, last_round_id or "?")
             try:
                 signal = runner.evaluate_once()
                 if signal is None:
@@ -122,12 +254,19 @@ def main() -> None:
                     token_id = yes_token_id if signal.action == "YES" else no_token_id
 
                     if token_id:
+                        # compute actual time left from round_id (format: "key:20260404T083500Z")
+                        try:
+                            round_start_str = signal.round_id.split(":")[1]
+                            round_start = datetime.strptime(round_start_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                            time_left_seconds = max(0, int((round_start + timedelta(seconds=300) - now).total_seconds()))
+                        except Exception:
+                            time_left_seconds = 60  # fallback
                         entry_result = live_engine.execute(
                             side=signal.action,
                             confidence=signal.confidence,
                             token_id=token_id,
                             quote=runner.polymarket.get_quote_for_spec_at(market_spec, now),
-                            time_left_seconds=0,  # signal already passed time guard
+                            time_left_seconds=time_left_seconds,
                             last_entry_ts=last_entry_ts,
                             now=now,
                         )
@@ -171,6 +310,7 @@ def main() -> None:
 
                 fh.write(json.dumps(row) + "\n")
                 fh.flush()
+                last_round_id = signal.round_id
 
             except KeyboardInterrupt:
                 log.info("Interrupted by user.")
