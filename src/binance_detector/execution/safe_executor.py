@@ -251,15 +251,23 @@ class SafeExecutor:
 
         stuck_nonce = old_tx["nonce"]
         old_max_fee = old_tx.get("maxFeePerGas") or old_tx.get("gasPrice") or 0
+        old_max_priority = old_tx.get("maxPriorityFeePerGas") or 0
 
-        # New gas: must beat old by ≥10%; also beat fresh estimate.
+        # EIP-1559 replacement requires BOTH maxFeePerGas AND maxPriorityFeePerGas
+        # to be at least 10% higher than the existing TX in the mempool.
+        # Using 1.3× (30% bump) on both to be safe.
         min_replacement_fee = int(old_max_fee * 1.3) + 1
+        min_replacement_priority = int(old_max_priority * 1.3) + 1
+
         try:
             pending = self.w3.eth.get_block("pending")
             base_fee = pending.get("baseFeePerGas", self.w3.eth.gas_price)
         except Exception:
             base_fee = self.w3.eth.gas_price
-        max_priority = self.w3.to_wei(int(_MIN_PRIORITY_FEE_GWEI * 1.3), "gwei")
+
+        # Fresh estimate: also bump base priority to 1.3× minimum
+        fresh_max_priority = self.w3.to_wei(int(_MIN_PRIORITY_FEE_GWEI * 1.3), "gwei")
+        max_priority = max(min_replacement_priority, fresh_max_priority)
         fresh_max_fee = base_fee * _BASE_FEE_MULTIPLIER + max_priority
         new_max_fee = max(min_replacement_fee, fresh_max_fee)
 
@@ -281,8 +289,8 @@ class SafeExecutor:
 
         signed = self._account.sign_transaction(tx)
         log.info(
-            "SafeExecutor: speed-up TX nonce=%d, old_fee=%d gwei → new_fee=%d gwei",
-            stuck_nonce, old_max_fee // 10**9, new_max_fee // 10**9,
+            "SafeExecutor: speed-up TX nonce=%d, old_fee=%d gwei → new_fee=%d gwei, priority=%d gwei",
+            stuck_nonce, old_max_fee // 10**9, new_max_fee // 10**9, max_priority // 10**9,
         )
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
         return "0x" + tx_hash.hex()

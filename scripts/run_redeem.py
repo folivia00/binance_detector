@@ -53,6 +53,7 @@ log = logging.getLogger("redeem")
 # Constants
 # ---------------------------------------------------------------------------
 POLYGON_RPC_FALLBACKS = [
+    "https://polygon-bor-rpc.publicnode.com",  # reliable confirmed-nonce reporting
     "https://1rpc.io/matic",
     "https://polygon-rpc.com",
     "https://rpc.ankr.com/polygon",

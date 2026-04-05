@@ -330,7 +330,9 @@ class LiveRedeemService:
             if receipt.get("status") == "pending":
                 # TX sent but not yet mined — save to pending state
                 self._save_pending(slug, tx_hash, round_id, market_info.condition_id,
-                                   yes_bal, no_bal, balance_usd, market_info.neg_risk)
+                                   yes_bal, no_bal, balance_usd, market_info.neg_risk,
+                                   yes_token_id=market_info.yes_token_id,
+                                   no_token_id=market_info.no_token_id)
                 return RedeemResult(
                     round_id=round_id, slug=slug,
                     condition_id=market_info.condition_id,
@@ -361,7 +363,15 @@ class LiveRedeemService:
     # ------------------------------------------------------------------
 
     def _resolve_pending(self, results: list[RedeemResult]) -> None:
-        """Check all pending TXs and move confirmed ones to done state."""
+        """Check all pending TXs and move confirmed ones to done state.
+
+        For each pending entry:
+        1. Try to get receipt.  If confirmed → mark done.  If reverted → remove.
+        2. If receipt=None (not mined) OR receipt check raises (429/RPC) → check CTF balance.
+           Balance=0 means the TX executed successfully at some point → mark done.
+        3. If balance>0 and TX is in mempool and old enough → speed-up.
+        4. If TX dropped from mempool → remove (will be retried on next scan).
+        """
         pending = self._load_pending()
         if not pending:
             return
@@ -375,66 +385,48 @@ class LiveRedeemService:
             if not tx_hash:
                 to_remove.append(slug)
                 continue
+
+            # --- Step 1: try receipt ---
+            receipt = None
+            receipt_error = False
             try:
                 receipt = self.w3.eth.get_transaction_receipt(tx_hash)
             except Exception as exc:
-                log.debug("[REDEEM] pending receipt check failed for %s: %s", slug, exc)
-                continue
+                log.warning(
+                    "[REDEEM] %s receipt check failed (%s) — falling back to balance check",
+                    slug, exc,
+                )
+                receipt_error = True
 
-            if receipt is None:
-                # TX not yet mined — check if in mempool or dropped, then maybe speed up.
-                try:
-                    tx_obj = self.w3.eth.get_transaction(tx_hash)
-                except Exception:
-                    tx_obj = None
-
-                if tx_obj is None:
-                    log.warning("[REDEEM] %s TX dropped from mempool (tx=%s) — will retry",
-                                slug, tx_hash)
+            if receipt is not None:
+                if receipt["status"] == 1:
+                    log.info("[REDEEM] pending TX confirmed: %s %.4f USDC tx=%s",
+                             slug, entry.get("balance_usd", 0), tx_hash)
+                    self._mark_done(done_state, slug, tx_hash)
+                    results.append(RedeemResult(
+                        round_id=entry.get("round_id", ""),
+                        slug=slug,
+                        condition_id=entry.get("condition_id", ""),
+                        yes_balance_shares=entry.get("yes_balance_shares", 0),
+                        no_balance_shares=entry.get("no_balance_shares", 0),
+                        balance_usd=entry.get("balance_usd", 0.0),
+                        status="redeemed",
+                        tx_hash=tx_hash,
+                    ))
                     to_remove.append(slug)
-                    continue
+                else:
+                    log.error("[REDEEM] pending TX reverted: %s (tx=%s)", slug, tx_hash)
+                    to_remove.append(slug)  # removed — will be retried fresh next scan
+                continue  # receipt handled — move on
 
-                log.debug("[REDEEM] %s in mempool (tx=%s)", slug, tx_hash)
-
-                # Speed-up check: if TX is too old, replace it with higher gas.
-                from binance_detector.execution.safe_executor import SPEED_UP_AFTER_SECONDS
-                sent_at_str = entry.get("sent_at", "")
-                age_seconds = 0.0
-                if sent_at_str:
-                    try:
-                        sent_at = datetime.fromisoformat(sent_at_str)
-                        age_seconds = (datetime.now(timezone.utc) - sent_at).total_seconds()
-                    except Exception:
-                        pass
-
-                if age_seconds > SPEED_UP_AFTER_SECONDS:
-                    log.info(
-                        "[REDEEM] %s TX stuck for %.0fs — attempting speed-up (tx=%s)",
-                        slug, age_seconds, tx_hash,
-                    )
-                    try:
-                        new_hash = self._speed_up_pending_tx(slug, entry, tx_hash)
-                        # Update pending entry with new tx_hash and reset sent_at
-                        entry["tx_hash"] = new_hash
-                        entry["sent_at"] = datetime.now(timezone.utc).isoformat()
-                        self._save_pending(
-                            slug=slug,
-                            tx_hash=new_hash,
-                            round_id=entry.get("round_id", ""),
-                            condition_id=entry.get("condition_id", ""),
-                            yes_bal=entry.get("yes_balance_shares", 0),
-                            no_bal=entry.get("no_balance_shares", 0),
-                            balance_usd=entry.get("balance_usd", 0.0),
-                            neg_risk=entry.get("neg_risk", False),
-                        )
-                        log.info("[REDEEM] %s speed-up TX sent: %s", slug, new_hash)
-                    except Exception as exc:
-                        log.error("[REDEEM] %s speed-up failed: %s", slug, exc)
-                continue
-
-            if receipt["status"] == 1:
-                log.info("[REDEEM] pending TX confirmed: %s %.4f USDC tx=%s",
-                         slug, entry.get("balance_usd", 0), tx_hash)
+            # --- Step 2: no receipt yet (or receipt check failed) → check CTF balance ---
+            # If balance=0, positions were already redeemed (TX went through, receipt just
+            # not returned cleanly). Mark as done to stop spinning on this entry.
+            if self._pending_balance_is_zero(slug, entry):
+                log.info(
+                    "[REDEEM] %s balance=0 — positions already redeemed, marking done (tx=%s)",
+                    slug, tx_hash,
+                )
                 self._mark_done(done_state, slug, tx_hash)
                 results.append(RedeemResult(
                     round_id=entry.get("round_id", ""),
@@ -447,12 +439,122 @@ class LiveRedeemService:
                     tx_hash=tx_hash,
                 ))
                 to_remove.append(slug)
+                continue
+
+            # Balance still > 0 — TX still needed.
+            # --- Step 3: TX still in mempool? check for dropped TX ---
+            # Do this even if receipt_error=True: "Transaction not found" in receipt check
+            # usually means the TX was dropped (not an RPC issue).
+            try:
+                tx_obj = self.w3.eth.get_transaction(tx_hash)
+            except Exception:
+                tx_obj = None
+
+            if tx_obj is None:
+                # TX not found anywhere (not mined, not in mempool) → dropped.
+                # Remove from pending so it can be re-sent on the next scan.
+                log.warning("[REDEEM] %s TX dropped from mempool (tx=%s) — will retry on next scan",
+                            slug, tx_hash)
+                to_remove.append(slug)
+                continue
+
+            log.debug("[REDEEM] %s in mempool (tx=%s)", slug, tx_hash)
+
+            # --- Step 4: speed-up if TX is old enough ---
+            from binance_detector.execution.safe_executor import SPEED_UP_AFTER_SECONDS
+            sent_at_str = entry.get("sent_at", "")
+            age_seconds = 0.0
+            if sent_at_str:
+                try:
+                    sent_at = datetime.fromisoformat(sent_at_str)
+                    age_seconds = (datetime.now(timezone.utc) - sent_at).total_seconds()
+                except Exception:
+                    pass
+
+            if age_seconds > SPEED_UP_AFTER_SECONDS:
+                log.info(
+                    "[REDEEM] %s TX stuck for %.0fs — attempting speed-up (tx=%s)",
+                    slug, age_seconds, tx_hash,
+                )
+                try:
+                    new_hash = self._speed_up_pending_tx(slug, entry, tx_hash)
+                    self._save_pending(
+                        slug=slug,
+                        tx_hash=new_hash,
+                        round_id=entry.get("round_id", ""),
+                        condition_id=entry.get("condition_id", ""),
+                        yes_bal=entry.get("yes_balance_shares", 0),
+                        no_bal=entry.get("no_balance_shares", 0),
+                        balance_usd=entry.get("balance_usd", 0.0),
+                        neg_risk=entry.get("neg_risk", False),
+                        yes_token_id=entry.get("yes_token_id"),
+                        no_token_id=entry.get("no_token_id"),
+                    )
+                    log.info("[REDEEM] %s speed-up TX sent: %s", slug, new_hash)
+                except Exception as exc:
+                    err = str(exc).lower()
+                    if "not found" in err or "cannot find" in err:
+                        # TX disappeared from mempool between our get_transaction check and
+                        # speed_up's own get_transaction call (load-balanced RPC returned
+                        # different node, or TX was just dropped). Remove from pending so a
+                        # fresh TX is sent on the next scan.
+                        log.warning(
+                            "[REDEEM] %s TX disappeared during speed-up (dropped) — "
+                            "removing from pending for fresh retry",
+                            slug,
+                        )
+                        to_remove.append(slug)
+                    else:
+                        log.error("[REDEEM] %s speed-up failed: %s", slug, exc)
             else:
-                log.error("[REDEEM] pending TX reverted: %s (tx=%s)", slug, tx_hash)
-                to_remove.append(slug)  # Remove from pending — will be retried fresh next scan
+                log.debug("[REDEEM] %s in mempool, age=%.0fs (speed-up after %ds)",
+                          slug, age_seconds, SPEED_UP_AFTER_SECONDS)
 
         if to_remove:
             self._remove_from_pending(to_remove)
+
+    def _pending_balance_is_zero(self, slug: str, entry: dict) -> bool:
+        """Return True if the pending position's CTF balance is now 0.
+
+        Uses token IDs stored in the pending entry (if available), otherwise
+        fetches from Gamma API.  Returns False on any error (fail-safe: prefer
+        retrying over incorrectly marking as done).
+        """
+        condition_id = entry.get("condition_id", "")
+        neg_risk = entry.get("neg_risk", False)
+
+        # Use stored token IDs when available (avoids Gamma API call on every check)
+        yes_token_id = entry.get("yes_token_id")
+        no_token_id = entry.get("no_token_id")
+
+        if yes_token_id is None or no_token_id is None:
+            # Fallback: fetch from Gamma (older pending entries without token IDs)
+            try:
+                result = _gamma_get("/markets", {"slug": slug})
+                if not isinstance(result, list) or not result:
+                    return False
+                clob_ids = _parse_clob_token_ids(result[0].get("clobTokenIds"))
+                if len(clob_ids) < 2:
+                    return False
+                yes_token_id = int(clob_ids[0])
+                no_token_id = int(clob_ids[1])
+            except Exception as exc:
+                log.debug("[REDEEM] %s balance check: Gamma fetch failed: %s", slug, exc)
+                return False
+
+        market_info = _MarketInfo(
+            slug=slug, round_id="",
+            condition_id=condition_id,
+            yes_token_id=int(yes_token_id),
+            no_token_id=int(no_token_id),
+            neg_risk=neg_risk,
+        )
+        try:
+            yes_bal, no_bal = self._check_balances_with_retry(market_info, attempts=2, delay=1.0)
+            return yes_bal == 0 and no_bal == 0
+        except Exception as exc:
+            log.debug("[REDEEM] %s balance check failed: %s", slug, exc)
+            return False
 
     def _speed_up_pending_tx(self, slug: str, entry: dict, old_tx_hash: str) -> str:
         """Rebuild calldata for a pending TX and send a replacement with higher gas."""
@@ -645,6 +747,7 @@ class LiveRedeemService:
     def _save_pending(
         self, slug: str, tx_hash: str, round_id: str, condition_id: str,
         yes_bal: int, no_bal: int, balance_usd: float, neg_risk: bool = False,
+        yes_token_id: int | None = None, no_token_id: int | None = None,
     ) -> None:
         with self._lock:
             pending = {}
@@ -653,7 +756,7 @@ class LiveRedeemService:
                     pending = json.loads(self._pending_file.read_text(encoding="utf-8"))
                 except Exception:
                     pass
-            pending[slug] = {
+            entry: dict = {
                 "tx_hash": tx_hash,
                 "round_id": round_id,
                 "condition_id": condition_id,
@@ -663,6 +766,11 @@ class LiveRedeemService:
                 "neg_risk": neg_risk,
                 "sent_at": datetime.now(timezone.utc).isoformat(),
             }
+            if yes_token_id is not None:
+                entry["yes_token_id"] = yes_token_id
+            if no_token_id is not None:
+                entry["no_token_id"] = no_token_id
+            pending[slug] = entry
             self._pending_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._pending_file.with_suffix(".pending_tmp")
             tmp.write_text(json.dumps(pending, indent=2), encoding="utf-8")
