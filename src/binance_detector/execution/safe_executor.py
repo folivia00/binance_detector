@@ -253,7 +253,10 @@ class SafeExecutor:
         tx_hash = self.execute(to=to, data=data, value=value, gas=gas)
         log.info("SafeExecutor: TX sent %s", tx_hash)
         try:
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            # poll_latency=5s: avoid 429 rate-limit from RPC (default is 0.1s = 1800 calls/5min)
+            receipt = self.w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=timeout, poll_latency=5
+            )
         except Exception as exc:
             # TimeExhausted or RPC error — TX may still be in mempool.
             # Return pending state so caller can track and retry.

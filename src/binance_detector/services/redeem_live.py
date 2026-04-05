@@ -213,16 +213,17 @@ class LiveRedeemService:
         self._resolve_pending(results)
 
         done_state = self._load_done()
+        pending_state = self._load_pending()
         all_slugs = self._collect_filled_slugs()
 
-        # Filter out already-done slugs BEFORE logging
+        # Filter out already-done and pending slugs BEFORE logging
         new_slugs = {
             slug: rid for slug, rid in all_slugs.items()
-            if slug not in done_state and slug not in self._load_pending()
+            if slug not in done_state and slug not in pending_state
         }
 
         total = len(all_slugs)
-        done_count = total - len(new_slugs)
+        done_count = len(done_state)
         if new_slugs:
             log.info(
                 "[REDEEM] scan: filled_in_logs=%d, already_done=%d, new_to_check=%d",
@@ -232,6 +233,17 @@ class LiveRedeemService:
             log.debug(
                 "[REDEEM] scan: filled_in_logs=%d, already_done=%d, new_to_check=0",
                 total, done_count,
+            )
+            return results
+
+        # If any TX is still pending (sent but unconfirmed), don't send new ones.
+        # New TXs would queue behind the pending one by nonce — if the pending TX
+        # is stuck (low gas, RPC issue), the queued ones get stuck too.
+        # Wait for pending to clear first, then proceed.
+        if pending_state:
+            log.info(
+                "[REDEEM] %d pending TX(s) still unconfirmed — skipping new sends until resolved.",
+                len(pending_state),
             )
             return results
 
@@ -370,7 +382,18 @@ class LiveRedeemService:
                 continue
 
             if receipt is None:
-                log.debug("[REDEEM] %s still pending (tx=%s)", slug, tx_hash)
+                # TX not yet mined. Check if it's still in mempool or dropped.
+                try:
+                    tx_obj = self.w3.eth.get_transaction(tx_hash)
+                    if tx_obj is None:
+                        log.warning("[REDEEM] %s TX dropped from mempool (tx=%s) — will retry",
+                                    slug, tx_hash)
+                        to_remove.append(slug)  # Remove from pending → retried fresh
+                    else:
+                        log.debug("[REDEEM] %s still in mempool (tx=%s, block=%s)",
+                                  slug, tx_hash, tx_obj.get("blockNumber"))
+                except Exception:
+                    log.debug("[REDEEM] %s still pending (tx=%s)", slug, tx_hash)
                 continue
 
             if receipt["status"] == 1:
