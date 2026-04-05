@@ -126,29 +126,36 @@ class SafeExecutor:
             return False
 
     def verify(self) -> dict:
-        """Return diagnostic info about the Safe (for logging/debugging)."""
-        try:
-            owners = self._safe.functions.getOwners().call()
-            threshold = self._safe.functions.getThreshold().call()
-            nonce = self._safe.functions.nonce().call()
+        """Return diagnostic info about the Safe (for logging/debugging).
+
+        Each call is independent — a failing RPC for one field does not block others.
+        eoa_is_owner is derived from getOwners() only (the critical check).
+        """
+        def _call(fn):
             try:
-                version = self._safe.functions.VERSION().call()
-            except Exception:
-                version = "unknown"
-            eoa_matic_wei = self.w3.eth.get_balance(self.eoa_address)
-            eoa_matic = eoa_matic_wei / 1e18
-            return {
-                "safe_address": self.safe_address,
-                "eoa_address": self.eoa_address,
-                "eoa_matic_balance": round(eoa_matic, 6),
-                "version": version,
-                "threshold": threshold,
-                "nonce": nonce,
-                "owners": [to_checksum_address(o) for o in owners],
-                "eoa_is_owner": any(to_checksum_address(o) == self.eoa_address for o in owners),
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+                return fn()
+            except Exception as exc:
+                return f"error: {exc}"
+
+        owners_raw = _call(lambda: self._safe.functions.getOwners().call())
+        owners: list[str] = []
+        eoa_is_owner = False
+        if isinstance(owners_raw, list):
+            owners = [to_checksum_address(o) for o in owners_raw]
+            eoa_is_owner = self.eoa_address in owners
+
+        return {
+            "safe_address": self.safe_address,
+            "eoa_address": self.eoa_address,
+            "eoa_matic_balance": round(
+                _call(lambda: self.w3.eth.get_balance(self.eoa_address) / 1e18) or 0.0, 6
+            ),
+            "version": _call(lambda: self._safe.functions.VERSION().call()),
+            "threshold": _call(lambda: self._safe.functions.getThreshold().call()),
+            "nonce": _call(lambda: self._safe.functions.nonce().call()),
+            "owners": owners,
+            "eoa_is_owner": eoa_is_owner,
+        }
 
     def execute(
         self,

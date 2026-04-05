@@ -159,14 +159,39 @@ def main() -> None:
 
     executor = SafeExecutor(w3=w3, safe_address=funder, eoa_private_key=private_key)
 
-    # Diagnostics
-    diag = executor.verify()
+    # Diagnostics — retry up to 3 times (transient RPC issues can return b'' on eth_call)
+    diag: dict = {}
+    for attempt in range(3):
+        diag = executor.verify()
+        if diag.get("eoa_is_owner"):
+            break
+        owners = diag.get("owners", [])
+        if owners and not diag.get("eoa_is_owner"):
+            break  # owners loaded OK but EOA genuinely not in list — don't retry
+        if attempt < 2:
+            log.warning("Safe verify failed (attempt %d/3), retrying in 3s...", attempt + 1)
+            time.sleep(3)
+
     log.info("Safe diagnostics: %s", json.dumps(diag, default=str))
+
     if not diag.get("eoa_is_owner"):
-        log.error("EOA %s is NOT owner of Safe %s — cannot execute.", executor.eoa_address, funder)
-        sys.exit(1)
+        owners = diag.get("owners", [])
+        if not owners:
+            log.error(
+                "Safe contract call failed (RPC issue?). "
+                "Try again or set POLYGON_RPC_URL to another endpoint."
+            )
+        else:
+            log.error("EOA %s is NOT owner of Safe %s — cannot execute.",
+                      executor.eoa_address, funder)
+        if not dry_run:
+            sys.exit(1)
+        log.warning("Continuing in dry-run mode despite verify failure.")
 
     matic_bal = diag.get("eoa_matic_balance", 0.0)
+    if isinstance(matic_bal, str):  # error string from _call
+        log.warning("Could not read MATIC balance: %s", matic_bal)
+        matic_bal = 0.0
     if matic_bal < 0.01:
         log.error(
             "EOA %s has only %.6f MATIC — insufficient for gas.\n"
