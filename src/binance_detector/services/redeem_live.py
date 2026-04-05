@@ -330,7 +330,7 @@ class LiveRedeemService:
             if receipt.get("status") == "pending":
                 # TX sent but not yet mined — save to pending state
                 self._save_pending(slug, tx_hash, round_id, market_info.condition_id,
-                                   yes_bal, no_bal, balance_usd)
+                                   yes_bal, no_bal, balance_usd, market_info.neg_risk)
                 return RedeemResult(
                     round_id=round_id, slug=slug,
                     condition_id=market_info.condition_id,
@@ -382,18 +382,54 @@ class LiveRedeemService:
                 continue
 
             if receipt is None:
-                # TX not yet mined. Check if it's still in mempool or dropped.
+                # TX not yet mined — check if in mempool or dropped, then maybe speed up.
                 try:
                     tx_obj = self.w3.eth.get_transaction(tx_hash)
-                    if tx_obj is None:
-                        log.warning("[REDEEM] %s TX dropped from mempool (tx=%s) — will retry",
-                                    slug, tx_hash)
-                        to_remove.append(slug)  # Remove from pending → retried fresh
-                    else:
-                        log.debug("[REDEEM] %s still in mempool (tx=%s, block=%s)",
-                                  slug, tx_hash, tx_obj.get("blockNumber"))
                 except Exception:
-                    log.debug("[REDEEM] %s still pending (tx=%s)", slug, tx_hash)
+                    tx_obj = None
+
+                if tx_obj is None:
+                    log.warning("[REDEEM] %s TX dropped from mempool (tx=%s) — will retry",
+                                slug, tx_hash)
+                    to_remove.append(slug)
+                    continue
+
+                log.debug("[REDEEM] %s in mempool (tx=%s)", slug, tx_hash)
+
+                # Speed-up check: if TX is too old, replace it with higher gas.
+                from binance_detector.execution.safe_executor import SPEED_UP_AFTER_SECONDS
+                sent_at_str = entry.get("sent_at", "")
+                age_seconds = 0.0
+                if sent_at_str:
+                    try:
+                        sent_at = datetime.fromisoformat(sent_at_str)
+                        age_seconds = (datetime.now(timezone.utc) - sent_at).total_seconds()
+                    except Exception:
+                        pass
+
+                if age_seconds > SPEED_UP_AFTER_SECONDS:
+                    log.info(
+                        "[REDEEM] %s TX stuck for %.0fs — attempting speed-up (tx=%s)",
+                        slug, age_seconds, tx_hash,
+                    )
+                    try:
+                        new_hash = self._speed_up_pending_tx(slug, entry, tx_hash)
+                        # Update pending entry with new tx_hash and reset sent_at
+                        entry["tx_hash"] = new_hash
+                        entry["sent_at"] = datetime.now(timezone.utc).isoformat()
+                        self._save_pending(
+                            slug=slug,
+                            tx_hash=new_hash,
+                            round_id=entry.get("round_id", ""),
+                            condition_id=entry.get("condition_id", ""),
+                            yes_bal=entry.get("yes_balance_shares", 0),
+                            no_bal=entry.get("no_balance_shares", 0),
+                            balance_usd=entry.get("balance_usd", 0.0),
+                            neg_risk=entry.get("neg_risk", False),
+                        )
+                        log.info("[REDEEM] %s speed-up TX sent: %s", slug, new_hash)
+                    except Exception as exc:
+                        log.error("[REDEEM] %s speed-up failed: %s", slug, exc)
                 continue
 
             if receipt["status"] == 1:
@@ -417,6 +453,33 @@ class LiveRedeemService:
 
         if to_remove:
             self._remove_from_pending(to_remove)
+
+    def _speed_up_pending_tx(self, slug: str, entry: dict, old_tx_hash: str) -> str:
+        """Rebuild calldata for a pending TX and send a replacement with higher gas."""
+        from eth_utils import to_checksum_address
+        condition_id = entry.get("condition_id", "")
+        neg_risk = entry.get("neg_risk", False)
+        if not condition_id:
+            raise ValueError("No condition_id in pending entry — cannot rebuild calldata")
+
+        cid_bytes = _condition_id_bytes(condition_id)
+        contract_addr = NEG_RISK_ADAPTER if neg_risk else CTF_ADDRESS
+        contract = self._neg_risk if neg_risk else self._ctf
+
+        calldata = contract.encode_abi(
+            "redeemPositions",
+            args=[
+                to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,
+                cid_bytes,
+                [1, 2],
+            ],
+        )
+        return self.safe_executor.speed_up(
+            old_tx_hash=old_tx_hash,
+            to=contract_addr,
+            data=calldata,
+        )
 
     # ------------------------------------------------------------------
     # Gamma / on-chain helpers
@@ -581,7 +644,7 @@ class LiveRedeemService:
 
     def _save_pending(
         self, slug: str, tx_hash: str, round_id: str, condition_id: str,
-        yes_bal: int, no_bal: int, balance_usd: float,
+        yes_bal: int, no_bal: int, balance_usd: float, neg_risk: bool = False,
     ) -> None:
         with self._lock:
             pending = {}
@@ -597,6 +660,7 @@ class LiveRedeemService:
                 "yes_balance_shares": yes_bal,
                 "no_balance_shares": no_bal,
                 "balance_usd": balance_usd,
+                "neg_risk": neg_risk,
                 "sent_at": datetime.now(timezone.utc).isoformat(),
             }
             self._pending_file.parent.mkdir(parents=True, exist_ok=True)

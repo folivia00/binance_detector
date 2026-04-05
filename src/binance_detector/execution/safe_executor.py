@@ -83,6 +83,8 @@ _MIN_PRIORITY_FEE_GWEI = 30
 _BASE_FEE_MULTIPLIER = 2
 # Receipt timeout: one full round (300s). TX on Polygon can be slow during congestion.
 _DEFAULT_WAIT_TIMEOUT = 300
+# Speed-up: if a pending TX is older than this many seconds, replace it with higher gas.
+SPEED_UP_AFTER_SECONDS = 600
 
 
 class SafeExecutorError(Exception):
@@ -231,6 +233,59 @@ class SafeExecutor:
                     tx["maxPriorityFeePerGas"] = max_priority
                     continue
                 raise SafeExecutorError(f"send_raw_transaction failed: {exc}") from exc
+
+    def speed_up(self, old_tx_hash: str, to: str, data: bytes, value: int = 0, gas: int = _DEFAULT_GAS) -> str:
+        """Replace a stuck pending TX with the same nonce but higher gas.
+
+        Polygon requires at least 10% higher maxFeePerGas to replace.
+        We use max(old_gas × 1.3, fresh_base_fee × 2 + priority) to be safe.
+
+        Returns new tx_hash.
+        """
+        try:
+            old_tx = self.w3.eth.get_transaction(old_tx_hash)
+        except Exception as exc:
+            raise SafeExecutorError(f"Cannot find TX {old_tx_hash}: {exc}") from exc
+        if old_tx is None:
+            raise SafeExecutorError(f"TX {old_tx_hash} not found in mempool (already dropped)")
+
+        stuck_nonce = old_tx["nonce"]
+        old_max_fee = old_tx.get("maxFeePerGas") or old_tx.get("gasPrice") or 0
+
+        # New gas: must beat old by ≥10%; also beat fresh estimate.
+        min_replacement_fee = int(old_max_fee * 1.3) + 1
+        try:
+            pending = self.w3.eth.get_block("pending")
+            base_fee = pending.get("baseFeePerGas", self.w3.eth.gas_price)
+        except Exception:
+            base_fee = self.w3.eth.gas_price
+        max_priority = self.w3.to_wei(int(_MIN_PRIORITY_FEE_GWEI * 1.3), "gwei")
+        fresh_max_fee = base_fee * _BASE_FEE_MULTIPLIER + max_priority
+        new_max_fee = max(min_replacement_fee, fresh_max_fee)
+
+        to = to_checksum_address(to)
+        sig = self._prevalidated_signature(self.eoa_address)
+        try:
+            tx = self._safe.functions.execTransaction(
+                to, value, data, 0, 0, 0, 0, _ZERO_ADDRESS, _ZERO_ADDRESS, sig,
+            ).build_transaction({
+                "from": self.eoa_address,
+                "nonce": stuck_nonce,
+                "gas": gas,
+                "maxFeePerGas": new_max_fee,
+                "maxPriorityFeePerGas": max_priority,
+                "chainId": 137,
+            })
+        except Exception as exc:
+            raise SafeExecutorError(f"speed_up build_transaction failed: {exc}") from exc
+
+        signed = self._account.sign_transaction(tx)
+        log.info(
+            "SafeExecutor: speed-up TX nonce=%d, old_fee=%d gwei → new_fee=%d gwei",
+            stuck_nonce, old_max_fee // 10**9, new_max_fee // 10**9,
+        )
+        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        return "0x" + tx_hash.hex()
 
     def execute_and_wait(
         self,
