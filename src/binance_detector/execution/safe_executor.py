@@ -177,7 +177,10 @@ class SafeExecutor:
             base_fee = self.w3.eth.gas_price
         max_priority = self.w3.to_wei(_MIN_PRIORITY_FEE_GWEI, "gwei")
         max_fee = base_fee * _BASE_FEE_MULTIPLIER + max_priority
-        eoa_nonce = self.w3.eth.get_transaction_count(self.eoa_address)
+        # Use "pending" to include any mempool TXs in nonce count.
+        # This prevents "replacement transaction underpriced" when a previous TX
+        # is still in mempool — new TXs queue after it instead of conflicting.
+        eoa_nonce = self.w3.eth.get_transaction_count(self.eoa_address, "pending")
 
         try:
             tx = self._safe.functions.execTransaction(
