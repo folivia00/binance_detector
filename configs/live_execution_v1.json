@@ -1,0 +1,7 @@
+{
+  "stake_usd": 5.0,
+  "cooldown_seconds": 30,
+  "min_entry_confidence": 0.55,
+  "no_entry_last_seconds": 10,
+  "dry_run": true
+}

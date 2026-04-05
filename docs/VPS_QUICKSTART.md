@@ -18,13 +18,23 @@ python -m pip install -r ./requirements.txt
 
 ## 3. Configure environment
 
+Paper loop works without any credentials (public market data only).
+
+For **live trading**, add credentials to `~/.bashrc` (never commit to git):
+
 ```bash
-cp ./.env.example ./.env
+# Polymarket wallet (signature_type=2 — no API keys needed)
+export PM_PRIVATE_KEY=0x<your_polygon_private_key>
+export PM_FUNDER_ADDRESS=0x<your_wallet_address>
+export PM_SIGNATURE_TYPE=2
 ```
 
-Fill `.env` only if you later add authenticated execution or private keys.
+Then reload: `source ~/.bashrc`
 
-Current paper/live-paper flows work with public market data.
+Verify connection before first trade:
+```bash
+python scripts/setup_pm_api_key.py
+```
 
 ## 4. Run tests
 
@@ -32,13 +42,27 @@ Current paper/live-paper flows work with public market data.
 PYTHONPATH=./src python -m unittest discover -s ./tests/unit -v
 ```
 
-## 5. Run a paper loop
+## 5. Run a paper loop (no credentials needed)
 
 ```bash
 python ./scripts/run_live_paper_loop.py --market-key btc_updown_5m --iterations 1800 --interval-seconds 5
 ```
 
-## 6. Analyze the run
+## 6. Run live trading loop
+
+Dry run first (checks everything, no real orders):
+```bash
+python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 360
+```
+
+Enable real orders (requires PM env vars from step 3):
+```bash
+python scripts/run_live_loop.py --market-key btc_updown_5m --iterations 1800 --live
+```
+
+Or set `dry_run: false` in `configs/live_execution_v1.json` and run without `--live`.
+
+## 7. Analyze the run
 
 ```bash
 python ./scripts/analyze_live_paper_loop.py ./data/logs/<NEW_FILE>.jsonl
@@ -50,7 +74,7 @@ Or compare with a previous run:
 python ./scripts/analyze_live_paper_loop.py ./data/logs/<NEW_FILE>.jsonl --compare-to ./data/logs/<OLD_FILE>.jsonl
 ```
 
-## 7. Optional observability server
+## 8. Optional observability server
 
 ```bash
 python ./scripts/run_observability_server.py

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Bot scaffold for predicting 5-minute Bitcoin price rounds on Polymarket using Binance market data."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "web3>=6.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
