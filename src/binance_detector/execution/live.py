@@ -135,18 +135,67 @@ class LiveExecutionEngine:
             )
 
         try:
-            from py_clob_client.clob_types import MarketOrderArgs, BUY
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=self.config.stake_usd,
-                side=BUY,  # always BUY the token for the predicted side
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
+
+            # Round price to tick (0.01)
+            rounded_price = float(
+                Decimal(str(ask_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             )
-            signed_order = self._clob.create_market_order(order_args)
-            resp = self._clob.post_order(signed_order)
+            # Compute size (shares) so that price × size has ≤ 2 decimal places.
+            # PM checks maker_amount = price × size and requires ≤ 2 decimals.
+            # Strategy: size = round_down(stake / price, 2) then round up by 0.01 steps
+            # until price × size has ≤ 2 decimal places (or keep as-is if it does).
+            p = Decimal(str(rounded_price))
+            s_target = Decimal(str(self.config.stake_usd)) / p
+            # Start from floor to 2 decimal places, find step that makes p*s 2-decimal
+            # Round down so we never exceed stake_usd; find nearest valid size
+            # where price × size has exactly ≤ 2 decimal places (PM constraint)
+            size_dec = s_target.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            for _ in range(200):
+                maker = (p * size_dec).quantize(Decimal("0.000001"))
+                if maker == maker.quantize(Decimal("0.01")):
+                    break
+                size_dec -= Decimal("0.01")
+
+            size = float(size_dec)
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=rounded_price,
+                size=size,
+                side="BUY",
+            )
+            signed_order = self._clob.create_order(
+                order_args,
+                PartialCreateOrderOptions(tick_size="0.01"),
+            )
+            # GTC limit at ask price fills immediately if liquidity available;
+            # avoids FOK precision constraints on maker/taker amounts
+            resp = self._clob.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID") or resp.get("id") or ""
             status = resp.get("status", "unknown")
-            # PM returns status="matched" for FOK filled, "cancelled" if not filled
+            # GTC: "matched"/"success" = filled immediately
+            # "live" = placed on book but not filled — cancel immediately
+            if status == "live" and order_id:
+                try:
+                    self._clob.cancel({"orderID": order_id})
+                except Exception:
+                    pass
+                return LiveExecutionResult(
+                    allowed=True,
+                    dry_run=False,
+                    side=side,
+                    token_id=token_id,
+                    stake_usd=self.config.stake_usd,
+                    order_id=order_id,
+                    filled_price=0.0,
+                    filled_size_usd=0.0,
+                    status="cancelled",
+                    block_reasons=(),
+                    error="GTC order not filled (no liquidity at ask)",
+                )
             if status in ("matched", "success"):
                 return LiveExecutionResult(
                     allowed=True,
