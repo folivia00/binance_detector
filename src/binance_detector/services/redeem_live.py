@@ -4,6 +4,13 @@ Reads live_loop_*.jsonl for filled orders, finds the corresponding markets
 on Gamma, checks CTF balances, and redeems through the Proxy Safe.
 
 Safe execution path: docs/stages/redeem_proxy_investigation.md (R1)
+
+Stage 30 improvements:
+- Pending TX tracking (redeem_pending.json) — handles receipt timeout
+- Date filter in _collect_filled_slugs (lookback_days)
+- Empty balance in-memory cache (avoids repeated RPC for settled markets)
+- Fixed log: filter done FIRST, then report new_to_check count
+- balanceOfBatch retry (3 attempts, 2s delay)
 """
 from __future__ import annotations
 
@@ -13,8 +20,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,7 +40,7 @@ USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 # ---------------------------------------------------------------------------
-# ABI — ConditionalTokens (same for NegRiskAdapter subset)
+# ABI
 # ---------------------------------------------------------------------------
 _CTF_ABI = [
     {
@@ -80,8 +87,9 @@ class RedeemResult:
     condition_id: str
     yes_balance_shares: int   # raw ERC-1155 units (6 decimals)
     no_balance_shares: int
-    balance_usd: float        # total redeemable (yes_bal + no_bal) / 1e6
-    status: str               # "redeemed" | "dry_run" | "skipped" | "failed" | "not_resolved" | "already_done"
+    balance_usd: float        # total redeemable (yes + no) / 1e6
+    status: str               # "redeemed" | "dry_run" | "skipped" | "failed"
+                              # | "not_resolved" | "already_done" | "pending"
     tx_hash: str = ""
     error: str = ""
 
@@ -99,7 +107,7 @@ class _MarketInfo:
     condition_id: str
     yes_token_id: int
     no_token_id: int
-    neg_risk: bool            # True → use NegRiskAdapter instead of CTF
+    neg_risk: bool
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +141,18 @@ def _parse_clob_token_ids(raw: object) -> list[str]:
     return []
 
 
+def _parse_round_date(round_id: str) -> datetime | None:
+    """Extract UTC date from round_id like 'btc_updown_5m:20260405T094000Z'."""
+    import re
+    m = re.search(r":(\d{8})T", round_id)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
@@ -145,6 +165,7 @@ class LiveRedeemService:
         safe_executor: Configured SafeExecutor (wraps PM_FUNDER_ADDRESS).
         log_dir: Directory containing live_loop_*.jsonl files.
         state_file: Path to redeem_done.json (tracks already redeemed slugs).
+        lookback_days: Only consider filled rounds from last N days (default: 2).
     """
 
     def __init__(
@@ -153,12 +174,15 @@ class LiveRedeemService:
         safe_executor: "SafeExecutor",
         log_dir: Path,
         state_file: Path,
+        lookback_days: int = 2,
     ) -> None:
         self.w3 = w3
         self.safe_executor = safe_executor
         self.log_dir = log_dir
         self.state_file = state_file
-        self._lock = threading.Lock()  # guards state_file reads/writes
+        self.lookback_days = lookback_days
+        self._pending_file = state_file.parent / "redeem_pending.json"
+        self._lock = threading.Lock()
 
         from eth_utils import to_checksum_address
         self._ctf = w3.eth.contract(
@@ -169,6 +193,11 @@ class LiveRedeemService:
         )
         self._safe_addr = safe_executor.safe_address
 
+        # In-memory cache of slugs confirmed to have zero balance.
+        # Avoids repeated balanceOfBatch calls for auto-settled markets.
+        # Not persisted — reset on service restart (intentional).
+        self._zero_balance_cache: set[str] = set()
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -176,30 +205,37 @@ class LiveRedeemService:
     def scan_and_redeem(self, dry_run: bool = True) -> list[RedeemResult]:
         """Find all winning positions and redeem them (or report in dry_run mode).
 
-        Flow per market:
-          1. Read logs → filled epochs
-          2. Skip already in redeem_done.json
-          3. Gamma: fetch market info (closed? negRisk? conditionId? clobTokenIds?)
-          4. balanceOfBatch on Safe → skip if both 0
-          5. payoutDenominator guard → skip if 0 (oracle not resolved yet)
-          6. dry_run? → log only; else execTransaction → redeemPositions [1, 2]
-          7. Write to redeem_done.json
+        Returns list of RedeemResult for positions that had non-zero balance.
         """
-        done_state = self._load_done()
-        filled_slugs = self._collect_filled_slugs()
         results: list[RedeemResult] = []
 
-        if not filled_slugs:
-            log.info("[REDEEM] No filled orders in logs.")
+        # Step 0: resolve any pending TXs from previous iterations
+        self._resolve_pending(results)
+
+        done_state = self._load_done()
+        all_slugs = self._collect_filled_slugs()
+
+        # Filter out already-done slugs BEFORE logging
+        new_slugs = {
+            slug: rid for slug, rid in all_slugs.items()
+            if slug not in done_state and slug not in self._load_pending()
+        }
+
+        total = len(all_slugs)
+        done_count = total - len(new_slugs)
+        if new_slugs:
+            log.info(
+                "[REDEEM] scan: filled_in_logs=%d, already_done=%d, new_to_check=%d",
+                total, done_count, len(new_slugs),
+            )
+        else:
+            log.debug(
+                "[REDEEM] scan: filled_in_logs=%d, already_done=%d, new_to_check=0",
+                total, done_count,
+            )
             return results
 
-        log.info("[REDEEM] Found %d filled slugs to check.", len(filled_slugs))
-
-        for slug, round_id in filled_slugs.items():
-            if slug in done_state:
-                log.debug("[REDEEM] %s — already redeemed, skipping.", slug)
-                continue
-
+        for slug, round_id in new_slugs.items():
             result = self._process_one(slug, round_id, done_state, dry_run)
             if result is not None:
                 results.append(result)
@@ -207,6 +243,11 @@ class LiveRedeemService:
                     log.info(
                         "[REDEEM] %s redeemed %.4f USDC tx=%s",
                         slug, result.balance_usd, result.tx_hash,
+                    )
+                elif result.status == "pending":
+                    log.warning(
+                        "[REDEEM] %s TX pending (will check next iteration) tx=%s",
+                        slug, result.tx_hash,
                     )
 
         return results
@@ -222,36 +263,36 @@ class LiveRedeemService:
         done_state: dict,
         dry_run: bool,
     ) -> RedeemResult | None:
-        # 1. Fetch market from Gamma
+        if slug in self._zero_balance_cache:
+            log.debug("[REDEEM] %s — zero balance cache hit, skipping.", slug)
+            return None
+
         market_info = self._fetch_market_info(slug, round_id)
         if market_info is None:
             return None
 
-        # 2. Check balances on Safe
         try:
-            yes_bal, no_bal = self._check_balances(market_info)
+            yes_bal, no_bal = self._check_balances_with_retry(market_info)
         except Exception as exc:
-            log.warning("[REDEEM] balanceOfBatch error for %s: %s", slug, exc)
+            log.warning("[REDEEM] balanceOfBatch failed for %s: %s", slug, exc)
             return None
 
         total_shares = yes_bal + no_bal
         if total_shares == 0:
-            log.debug("[REDEEM] %s — zero balance, skipping.", slug)
+            log.debug("[REDEEM] %s — zero balance, caching.", slug)
+            self._zero_balance_cache.add(slug)
             return None
 
         balance_usd = total_shares / 1e6
         log.info("[REDEEM] %s — YES=%d NO=%d (%.4f USDC)", slug, yes_bal, no_bal, balance_usd)
 
-        # 3. E4 guard: check oracle resolved via payoutDenominator.
-        # If the call succeeds and returns 0 → oracle hasn't resolved yet, skip.
-        # If the call fails (empty bytes, unsupported selector) → unknown, proceed;
-        # redeemPositions will revert on-chain if not yet resolved, costing minimal gas.
+        # E4 guard: payoutDenominator — if 0 oracle not resolved; if call fails proceed
         try:
             cid_bytes = _condition_id_bytes(market_info.condition_id)
             contract = self._neg_risk if market_info.neg_risk else self._ctf
             payout_denom = contract.functions.payoutDenominator(cid_bytes).call()
             if payout_denom == 0:
-                log.info("[REDEEM] %s — oracle not yet resolved (payoutDenominator=0), skipping.", slug)
+                log.info("[REDEEM] %s — oracle not yet resolved, skipping.", slug)
                 return RedeemResult(
                     round_id=round_id, slug=slug,
                     condition_id=market_info.condition_id,
@@ -259,11 +300,8 @@ class LiveRedeemService:
                     balance_usd=balance_usd, status="not_resolved",
                 )
         except Exception as exc:
-            # payoutDenominator may not be exposed on this CTF version — proceed;
-            # if oracle isn't ready, redeemPositions will revert (caught below).
             log.debug("[REDEEM] payoutDenominator unavailable for %s (%s) — proceeding.", slug, exc)
 
-        # 4. Dry run
         if dry_run:
             log.info("[REDEEM] DRY RUN — would redeem %s (%.4f USDC)", slug, balance_usd)
             return RedeemResult(
@@ -273,15 +311,27 @@ class LiveRedeemService:
                 balance_usd=balance_usd, status="dry_run",
             )
 
-        # 5. Execute redeemPositions through Safe
         try:
-            tx_hash = self._redeem_via_safe(market_info)
+            receipt = self._redeem_via_safe(market_info)
+            tx_hash = _extract_tx_hash(receipt)
+
+            if receipt.get("status") == "pending":
+                # TX sent but not yet mined — save to pending state
+                self._save_pending(slug, tx_hash, round_id, market_info.condition_id,
+                                   yes_bal, no_bal, balance_usd)
+                return RedeemResult(
+                    round_id=round_id, slug=slug,
+                    condition_id=market_info.condition_id,
+                    yes_balance_shares=yes_bal, no_balance_shares=no_bal,
+                    balance_usd=balance_usd, status="pending", tx_hash=tx_hash,
+                )
+
+            # Confirmed
             result = RedeemResult(
                 round_id=round_id, slug=slug,
                 condition_id=market_info.condition_id,
                 yes_balance_shares=yes_bal, no_balance_shares=no_bal,
-                balance_usd=balance_usd,
-                status="redeemed", tx_hash=tx_hash,
+                balance_usd=balance_usd, status="redeemed", tx_hash=tx_hash,
             )
             self._mark_done(done_state, slug, tx_hash)
             return result
@@ -293,6 +343,57 @@ class LiveRedeemService:
                 yes_balance_shares=yes_bal, no_balance_shares=no_bal,
                 balance_usd=balance_usd, status="failed", error=str(exc),
             )
+
+    # ------------------------------------------------------------------
+    # Pending TX resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_pending(self, results: list[RedeemResult]) -> None:
+        """Check all pending TXs and move confirmed ones to done state."""
+        pending = self._load_pending()
+        if not pending:
+            return
+
+        done_state = self._load_done()
+        log.info("[REDEEM] Checking %d pending TX(s)...", len(pending))
+        to_remove: list[str] = []
+
+        for slug, entry in pending.items():
+            tx_hash = entry.get("tx_hash", "")
+            if not tx_hash:
+                to_remove.append(slug)
+                continue
+            try:
+                receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            except Exception as exc:
+                log.debug("[REDEEM] pending receipt check failed for %s: %s", slug, exc)
+                continue
+
+            if receipt is None:
+                log.debug("[REDEEM] %s still pending (tx=%s)", slug, tx_hash)
+                continue
+
+            if receipt["status"] == 1:
+                log.info("[REDEEM] pending TX confirmed: %s %.4f USDC tx=%s",
+                         slug, entry.get("balance_usd", 0), tx_hash)
+                self._mark_done(done_state, slug, tx_hash)
+                results.append(RedeemResult(
+                    round_id=entry.get("round_id", ""),
+                    slug=slug,
+                    condition_id=entry.get("condition_id", ""),
+                    yes_balance_shares=entry.get("yes_balance_shares", 0),
+                    no_balance_shares=entry.get("no_balance_shares", 0),
+                    balance_usd=entry.get("balance_usd", 0.0),
+                    status="redeemed",
+                    tx_hash=tx_hash,
+                ))
+                to_remove.append(slug)
+            else:
+                log.error("[REDEEM] pending TX reverted: %s (tx=%s)", slug, tx_hash)
+                to_remove.append(slug)  # Remove from pending — will be retried fresh next scan
+
+        if to_remove:
+            self._remove_from_pending(to_remove)
 
     # ------------------------------------------------------------------
     # Gamma / on-chain helpers
@@ -328,54 +429,58 @@ class LiveRedeemService:
             return None
 
         return _MarketInfo(
-            slug=slug,
-            round_id=round_id,
+            slug=slug, round_id=round_id,
             condition_id=condition_id,
-            yes_token_id=yes_token_id,
-            no_token_id=no_token_id,
+            yes_token_id=yes_token_id, no_token_id=no_token_id,
             neg_risk=bool(market.get("negRisk", False)),
         )
 
-    def _check_balances(self, market_info: _MarketInfo) -> tuple[int, int]:
-        """Return (yes_balance, no_balance) on the Safe address."""
+    def _check_balances_with_retry(
+        self, market_info: _MarketInfo, attempts: int = 3, delay: float = 2.0
+    ) -> tuple[int, int]:
+        """balanceOfBatch with retry on RPC error."""
         ids = [market_info.yes_token_id, market_info.no_token_id]
         accounts = [self._safe_addr, self._safe_addr]
         contract = self._neg_risk if market_info.neg_risk else self._ctf
-        balances = contract.functions.balanceOfBatch(accounts, ids).call()
-        return int(balances[0]), int(balances[1])
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                balances = contract.functions.balanceOfBatch(accounts, ids).call()
+                return int(balances[0]), int(balances[1])
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    log.debug("[REDEEM] balanceOfBatch attempt %d failed for %s: %s — retrying",
+                              attempt + 1, market_info.slug, exc)
+                    time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
-    def _redeem_via_safe(self, market_info: _MarketInfo) -> str:
-        """Build redeemPositions calldata and execute through Safe. Returns tx_hash."""
+    def _redeem_via_safe(self, market_info: _MarketInfo) -> dict:
+        """Build redeemPositions calldata and execute through Safe. Returns receipt dict."""
         from eth_utils import to_checksum_address
 
         cid_bytes = _condition_id_bytes(market_info.condition_id)
         contract_addr = NEG_RISK_ADAPTER if market_info.neg_risk else CTF_ADDRESS
         contract = self._neg_risk if market_info.neg_risk else self._ctf
 
-        # indexSets=[1,2] redeems both YES and NO in a single tx.
-        # CTF silently skips the side with zero balance.
         calldata = contract.encode_abi(
             "redeemPositions",
             args=[
-                to_checksum_address(USDC_ADDRESS),  # collateralToken
-                b"\x00" * 32,                       # parentCollectionId = bytes32(0)
-                cid_bytes,                           # conditionId
-                [1, 2],                              # indexSets: YES=1, NO=2
+                to_checksum_address(USDC_ADDRESS),
+                b"\x00" * 32,
+                cid_bytes,
+                [1, 2],
             ],
         )
-
-        receipt = self.safe_executor.execute_and_wait(
-            to=contract_addr,
-            data=calldata,
-        )
-        return receipt["transactionHash"].hex() if isinstance(receipt["transactionHash"], bytes) else receipt["transactionHash"]
+        return self.safe_executor.execute_and_wait(to=contract_addr, data=calldata)
 
     # ------------------------------------------------------------------
     # Log scanning
     # ------------------------------------------------------------------
 
     def _collect_filled_slugs(self) -> dict[str, str]:
-        """Return {slug: round_id} for all filled entries in live_loop logs."""
+        """Return {slug: round_id} for filled entries within lookback_days."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
         slugs: dict[str, str] = {}
         if not self.log_dir.exists():
             return slugs
@@ -394,6 +499,13 @@ class LiveRedeemService:
                         round_id = row.get("round_id", "")
                         if ":" not in round_id:
                             continue
+
+                        # Date filter: skip rounds older than lookback_days.
+                        # If unparseable → include (safe default, better a redundant check).
+                        round_date = _parse_round_date(round_id)
+                        if round_date is not None and round_date < cutoff:
+                            continue
+
                         ts_str = round_id.split(":")[1]
                         try:
                             dt = datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(
@@ -409,11 +521,10 @@ class LiveRedeemService:
         return slugs
 
     # ------------------------------------------------------------------
-    # State persistence  (redeem_done.json)
+    # State persistence
     # ------------------------------------------------------------------
 
     def _load_done(self) -> dict:
-        """Load {slug: tx_hash} from redeem_done.json."""
         with self._lock:
             if not self.state_file.exists():
                 return {}
@@ -425,7 +536,6 @@ class LiveRedeemService:
     def _mark_done(self, done_state: dict, slug: str, tx_hash: str) -> None:
         """Atomically update redeem_done.json."""
         with self._lock:
-            # Reload to pick up any changes from parallel runs
             if self.state_file.exists():
                 try:
                     done_state = json.loads(self.state_file.read_text(encoding="utf-8"))
@@ -436,3 +546,62 @@ class LiveRedeemService:
             tmp = self.state_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(done_state, indent=2), encoding="utf-8")
             tmp.replace(self.state_file)
+
+    def _load_pending(self) -> dict:
+        with self._lock:
+            if not self._pending_file.exists():
+                return {}
+            try:
+                return json.loads(self._pending_file.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+
+    def _save_pending(
+        self, slug: str, tx_hash: str, round_id: str, condition_id: str,
+        yes_bal: int, no_bal: int, balance_usd: float,
+    ) -> None:
+        with self._lock:
+            pending = {}
+            if self._pending_file.exists():
+                try:
+                    pending = json.loads(self._pending_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            pending[slug] = {
+                "tx_hash": tx_hash,
+                "round_id": round_id,
+                "condition_id": condition_id,
+                "yes_balance_shares": yes_bal,
+                "no_balance_shares": no_bal,
+                "balance_usd": balance_usd,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._pending_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._pending_file.with_suffix(".pending_tmp")
+            tmp.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+            tmp.replace(self._pending_file)
+
+    def _remove_from_pending(self, slugs: list[str]) -> None:
+        with self._lock:
+            if not self._pending_file.exists():
+                return
+            try:
+                pending = json.loads(self._pending_file.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            for slug in slugs:
+                pending.pop(slug, None)
+            tmp = self._pending_file.with_suffix(".pending_tmp")
+            tmp.write_text(json.dumps(pending, indent=2), encoding="utf-8")
+            tmp.replace(self._pending_file)
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _extract_tx_hash(receipt: dict) -> str:
+    raw = receipt.get("transactionHash", "")
+    if isinstance(raw, bytes):
+        return "0x" + raw.hex()
+    return str(raw)

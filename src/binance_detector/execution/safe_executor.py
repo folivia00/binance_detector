@@ -78,6 +78,11 @@ _ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Actual usage on Polygon is ~120-150k; 250k gives a safe margin without overpaying.
 _DEFAULT_GAS = 250_000
 _MIN_PRIORITY_FEE_GWEI = 30
+# base_fee multiplier: 2× gives room for a 2× spike in base fee between estimation and inclusion.
+# base_fee + 30gwei is too tight — if base_fee spikes the TX gets stuck in mempool.
+_BASE_FEE_MULTIPLIER = 2
+# Receipt timeout: one full round (300s). TX on Polygon can be slow during congestion.
+_DEFAULT_WAIT_TIMEOUT = 300
 
 
 class SafeExecutorError(Exception):
@@ -162,15 +167,16 @@ class SafeExecutor:
         to = to_checksum_address(to)
         sig = self._prevalidated_signature(self.eoa_address)
 
-        # Use baseFeePerGas + priority to avoid overpaying.
-        # Fall back to gas_price * 1.3 if pending block unavailable.
+        # maxFeePerGas = base_fee * 2 + priority.
+        # Multiplying base_fee by 2 gives enough room for a 2× spike between
+        # estimation and inclusion. base_fee + 30gwei alone is too tight on Polygon.
         try:
             pending = self.w3.eth.get_block("pending")
             base_fee = pending.get("baseFeePerGas", self.w3.eth.gas_price)
         except Exception:
             base_fee = self.w3.eth.gas_price
         max_priority = self.w3.to_wei(_MIN_PRIORITY_FEE_GWEI, "gwei")
-        max_fee = max(base_fee + max_priority, max_priority)
+        max_fee = base_fee * _BASE_FEE_MULTIPLIER + max_priority
         eoa_nonce = self.w3.eth.get_transaction_count(self.eoa_address)
 
         try:
@@ -209,15 +215,31 @@ class SafeExecutor:
         data: bytes,
         value: int = 0,
         gas: int = _DEFAULT_GAS,
-        timeout: int = 120,
+        timeout: int = _DEFAULT_WAIT_TIMEOUT,
     ) -> dict:
         """Execute and wait for receipt. Returns receipt dict.
 
-        Raises SafeExecutorError if tx reverts (status=0).
+        Receipt dict always contains:
+          - "transactionHash": hex string
+          - "status": 1 (confirmed) or "pending" (timed out, TX in mempool)
+
+        Raises SafeExecutorError only if TX reverts (status=0).
+        On timeout (TX in mempool but not yet mined) returns {"status": "pending", ...}
+        so the caller can persist the tx_hash and check it later.
         """
         tx_hash = self.execute(to=to, data=data, value=value, gas=gas)
         log.info("SafeExecutor: TX sent %s", tx_hash)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        try:
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except Exception as exc:
+            # TimeExhausted or RPC error — TX may still be in mempool.
+            # Return pending state so caller can track and retry.
+            log.warning(
+                "SafeExecutor: receipt timeout for %s (%s) — TX may still be pending",
+                tx_hash, exc,
+            )
+            return {"status": "pending", "transactionHash": tx_hash}
+
         if receipt["status"] != 1:
             raise SafeExecutorError(
                 f"TX reverted: {tx_hash} (status={receipt['status']})"

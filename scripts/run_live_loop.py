@@ -67,7 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redeem-dry-run", action="store_true",
                         help="RedeemWorker checks balances but sends no transactions.")
     parser.add_argument("--redeem-interval", type=int, default=300,
-                        help="RedeemWorker scan interval in seconds (default: 300).")
+                        help="Active scan interval in seconds (default: 300).")
+    parser.add_argument("--redeem-idle-interval", type=int, default=900,
+                        help="Idle scan interval when no new slugs found (default: 900).")
+    parser.add_argument("--redeem-idle-threshold", type=int, default=3,
+                        help="Empty scans before switching to idle mode (default: 3).")
+    parser.add_argument("--redeem-lookback-days", type=int, default=2,
+                        help="How many days back to scan filled orders (default: 2).")
     return parser.parse_args()
 
 
@@ -119,7 +125,7 @@ def _connect_polygon() -> object | None:
     return None
 
 
-def _build_redeem_service(log_dir: Path, state_file: Path) -> object | None:
+def _build_redeem_service(log_dir: Path, state_file: Path, lookback_days: int = 2) -> object | None:
     """Build SafeExecutor + LiveRedeemService. Returns service or None on error."""
     private_key = os.getenv("PM_PRIVATE_KEY", "")
     funder = os.getenv("PM_FUNDER_ADDRESS", "")
@@ -145,6 +151,7 @@ def _build_redeem_service(log_dir: Path, state_file: Path) -> object | None:
             safe_executor=executor,
             log_dir=log_dir,
             state_file=state_file,
+            lookback_days=lookback_days,
         )
         return service
     except Exception as exc:
@@ -152,27 +159,59 @@ def _build_redeem_service(log_dir: Path, state_file: Path) -> object | None:
         return None
 
 
-def _redeem_worker(service: object, interval_seconds: int, dry_run: bool) -> None:
-    """Background daemon thread: scan and redeem every interval_seconds."""
-    log.info("[REDEEM] Worker started (interval=%ds, dry_run=%s)", interval_seconds, dry_run)
+def _redeem_worker(
+    service: object,
+    active_interval: int,
+    dry_run: bool,
+    idle_interval: int = 900,
+    idle_threshold: int = 3,
+) -> None:
+    """Background daemon thread with adaptive interval.
+
+    State machine:
+      ACTIVE (active_interval): scan found new candidates → stay ACTIVE
+      ACTIVE → IDLE: empty_scans >= idle_threshold (consecutive empty scans)
+      IDLE (idle_interval): new candidate found → back to ACTIVE immediately
+    """
+    log.info(
+        "[REDEEM] Worker started (active=%ds, idle=%ds, idle_after=%d empty scans, dry_run=%s)",
+        active_interval, idle_interval, idle_threshold, dry_run,
+    )
+    state = "ACTIVE"
+    empty_scans = 0
+
     while True:
+        interval = active_interval if state == "ACTIVE" else idle_interval
         try:
             results = service.scan_and_redeem(dry_run=dry_run)
-            redeemed = [r for r in results if r.status == "redeemed"]
-            dry_found = [r for r in results if r.status == "dry_run"]
-            if redeemed:
-                for r in redeemed:
-                    log.info("[REDEEM] Redeemed %s %.4f USDC tx=%s",
-                             r.slug, r.balance_usd, r.tx_hash)
-            elif dry_found:
-                for r in dry_found:
-                    log.info("[REDEEM] DRY_RUN %s would redeem %.4f USDC",
-                             r.slug, r.balance_usd)
+            actionable = [r for r in results if r.status in ("redeemed", "dry_run", "pending")]
+
+            if actionable:
+                empty_scans = 0
+                if state == "IDLE":
+                    log.info("[REDEEM] state: IDLE → ACTIVE (new candidate found)")
+                    state = "ACTIVE"
+                for r in actionable:
+                    if r.status == "redeemed":
+                        log.info("[REDEEM] Redeemed %s %.4f USDC tx=%s",
+                                 r.slug, r.balance_usd, r.tx_hash)
+                    elif r.status == "dry_run":
+                        log.info("[REDEEM] DRY_RUN %s would redeem %.4f USDC",
+                                 r.slug, r.balance_usd)
             else:
-                log.debug("[REDEEM] No new positions to redeem.")
+                empty_scans += 1
+                if state == "ACTIVE" and empty_scans >= idle_threshold:
+                    log.info(
+                        "[REDEEM] state: ACTIVE → IDLE (%d empty scans, next in %ds)",
+                        empty_scans, idle_interval,
+                    )
+                    state = "IDLE"
+                    empty_scans = 0
+
         except Exception as exc:
             log.error("[REDEEM] Worker error: %s", exc, exc_info=True)
-        time.sleep(interval_seconds)
+
+        time.sleep(interval)
 
 
 def main() -> None:
@@ -209,18 +248,24 @@ def main() -> None:
         redeem_service = _build_redeem_service(
             log_dir=ROOT / "data" / "logs",
             state_file=state_file,
+            lookback_days=args.redeem_lookback_days,
         )
         if redeem_service is not None:
             t = threading.Thread(
                 target=_redeem_worker,
                 args=(redeem_service, args.redeem_interval, args.redeem_dry_run),
+                kwargs={
+                    "idle_interval": args.redeem_idle_interval,
+                    "idle_threshold": args.redeem_idle_threshold,
+                },
                 daemon=True,
                 name="RedeemWorker",
             )
             t.start()
             log.info(
-                "RedeemWorker started (interval=%ds, dry_run=%s, state=%s)",
-                args.redeem_interval, args.redeem_dry_run, state_file,
+                "RedeemWorker started (active=%ds, idle=%ds, lookback=%dd, dry_run=%s)",
+                args.redeem_interval, args.redeem_idle_interval,
+                args.redeem_lookback_days, args.redeem_dry_run,
             )
         else:
             log.warning("RedeemWorker could not start — check env vars and RPC.")
