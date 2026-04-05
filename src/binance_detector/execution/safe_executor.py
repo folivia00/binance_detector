@@ -205,12 +205,25 @@ class SafeExecutor:
         except Exception as exc:
             raise SafeExecutorError(f"build_transaction failed: {exc}") from exc
 
-        try:
-            signed = self._account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            return "0x" + tx_hash.hex()
-        except Exception as exc:
-            raise SafeExecutorError(f"send_raw_transaction failed: {exc}") from exc
+        # Retry loop: on "replacement transaction underpriced" bump gas by 30% and retry.
+        # This replaces any stuck pending TX at the same nonce (Polygon requires ≥10% bump).
+        for attempt in range(3):
+            try:
+                signed = self._account.sign_transaction(tx)
+                tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                return "0x" + tx_hash.hex()
+            except Exception as exc:
+                if "replacement transaction underpriced" in str(exc) and attempt < 2:
+                    log.warning(
+                        "SafeExecutor: replacement underpriced (attempt %d) — bumping gas +30%%",
+                        attempt + 1,
+                    )
+                    max_fee = int(max_fee * 1.3)
+                    max_priority = int(max_priority * 1.3)
+                    tx["maxFeePerGas"] = max_fee
+                    tx["maxPriorityFeePerGas"] = max_priority
+                    continue
+                raise SafeExecutorError(f"send_raw_transaction failed: {exc}") from exc
 
     def execute_and_wait(
         self,
